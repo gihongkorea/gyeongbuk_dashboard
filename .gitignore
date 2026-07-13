@@ -1,0 +1,13 @@
+# GitHub에 올리면 안 되는 것들
+# (사용 시 파일명을 .gitignore 로 변경)
+
+# 인증키 등 비밀 파일 - 절대 커밋 금지
+.streamlit/secrets.toml
+
+# 파이썬 임시 파일
+__pycache__/
+*.pyc
+
+# 가상환경
+venv/
+.venv/
