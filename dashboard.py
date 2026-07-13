@@ -30,7 +30,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v4.0 (학생수 통합)"
+VERSION = "v4.1 (동명이교 좌표 오배치 수정)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -163,9 +163,14 @@ def load_geo() -> pd.DataFrame | None:
     # 2차 매칭용 주소키 생성
     if "geo주소" in out.columns:
         out["주소키"] = norm_addr(out["geo주소"])
+        # 시군 파생: 동명이교 구분용 ("경상북도 상주시 ..." → "상주시")
+        out["시군"] = out["geo주소"].astype(str).str.split().str[1]
 
-    # 동명 학교 중복 제거 (병합 시 행 불어남 방지)
-    out = out.drop_duplicates(subset="학교명", keep="first")
+    # 동명 학교 중복 제거: 반드시 (학교명+시군) 기준!
+    # 학교명만으로 제거하면 옥산초(경주/상주) 같은 동명이교 12쌍에서
+    # 한쪽 좌표가 소멸 → 남은 좌표가 두 학교 모두에 잘못 붙는다 (v4.0 버그)
+    dedup_keys = ["학교명", "시군"] if "시군" in out.columns else ["학교명"]
+    out = out.drop_duplicates(subset=dedup_keys, keep="first")
     return out
 
 
@@ -180,11 +185,20 @@ def match_coords(view: pd.DataFrame, geo: pd.DataFrame) -> pd.DataFrame:
           주소만으로 매칭하면 엉뚱한 학교 좌표가 붙을 수 있다.
           그래서 반드시 학교급까지 함께 맞춰야 안전하다.
     """
-    # ── 1차: 학교명 ──
-    merged = view.merge(
-        geo[["학교명", "위도", "경도"]],
-        left_on="SCHUL_NM", right_on="학교명", how="left",
-    ).drop(columns=["학교명"])
+    # ── 1차: 학교명 + 시군 ──
+    # 학교명만 쓰면 동명이교(옥산초 경주/상주 등 12쌍)에 엉뚱한 좌표가 붙는다.
+    # 시군까지 맞추면 같은 이름이라도 다른 지역이면 매칭되지 않는다.
+    if "시군" in geo.columns:
+        merged = view.merge(
+            geo[["학교명", "시군", "위도", "경도"]],
+            left_on=["SCHUL_NM", "시군"], right_on=["학교명", "시군"], how="left",
+        ).drop(columns=["학교명"])
+    else:
+        # 방어: 위치데이터에 주소가 없어 시군 파생이 불가한 경우 이름만으로
+        merged = view.merge(
+            geo[["학교명", "위도", "경도"]],
+            left_on="SCHUL_NM", right_on="학교명", how="left",
+        ).drop(columns=["학교명"])
 
     # ── 2차: 주소키 + 학교급 (1차 실패분만) ──
     if "주소키" in geo.columns and "geo학교급" in geo.columns:
