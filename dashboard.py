@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-경북 학교 현황 대시보드 v3
-추가: 탭 구조 재편, folium 지도(위치표준데이터 병합), 급식·학사일정 실시간 API
+경북 학교 현황 대시보드 v4
+추가: 학교알리미 학생수 통합 (KPI·지도 마커 크기·학생수 차트·소규모학교 필터)
 
 준비물:
     pip install streamlit plotly folium streamlit-folium requests
     1) gyeongbuk_schools.csv          (나이스 수집본, 같은 폴더)
     2) school_locations.csv           (data.go.kr '전국초중등학교위치표준데이터', 같은 폴더)
-    3) 아래 API_KEY 에 나이스 인증키 입력
+    3) alimi_gyeongbuk_62.csv         (학교알리미 수집본, alimi_api_test.py로 생성)
+    4) .streamlit/secrets.toml 에 NEIS_KEY 입력 (급식·학사일정용)
 
 실행:  python -m streamlit run dashboard.py
 """
@@ -29,7 +30,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v3.4 (배포 준비: secrets 지원)"
+VERSION = "v4.0 (학생수 통합)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -43,6 +44,8 @@ except Exception:
 OFFICE_CODE = "R10"   # 경상북도교육청
 
 GEO_CSV = "school_locations.csv"   # 위치표준데이터 파일명
+ALIMI_CSV = "alimi_gyeongbuk_62.csv"   # 학교알리미 학교현황(62) 수집본
+SMALL_MAX = 60                     # 소규모학교 기준: 전교생 60명 이하
 
 # 학교급별 지도 마커 색
 # 원칙: 서로 구분되어야 할 범주는 색상환에서 멀리 떨어진 색으로.
@@ -209,6 +212,52 @@ def match_coords(view: pd.DataFrame, geo: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════
+# [역할 ③-2] 학교알리미 학생수 병합
+#   - 알리미 SCHUL_CODE는 나이스 코드와 다른 체계 → 코드 병합 불가
+#   - 대신 3중 키(학교명+학교급+시군)로 병합
+#     (검증 결과: 경북에 동명이교 10쌍 존재 → 시군까지 맞춰야 안전)
+# ══════════════════════════════════════════════════════════
+# 명칭 불일치 별칭 사전: 알리미 표기 → 나이스 표기
+# (검증에서 발견된 유일한 명칭 차이. 새로 발견되면 여기에 추가)
+ALIMI_ALIAS = {
+    "청송여자종합고등학교": "청송여자고등학교",
+}
+
+
+@st.cache_data
+def load_alimi() -> pd.DataFrame | None:
+    """알리미 학교현황(62)에서 병합 키 3종 + 학생수·학급수를 추출. 파일 없으면 None."""
+    try:
+        al = read_csv_any_encoding(ALIMI_CSV)
+    except FileNotFoundError:
+        return None
+    need = {"SCHUL_NM", "_학교급", "_시군구", "학생수", "학급수"}
+    if not need <= set(al.columns):
+        return None   # 정제 컬럼이 없는 옛 수집본이면 사용하지 않음 (방어)
+
+    al = al.copy()
+    # 별칭 적용: 알리미 학교명을 나이스 표기로 통일
+    al["SCHUL_NM"] = al["SCHUL_NM"].replace(ALIMI_ALIAS)
+    # 시군 정규화: '포항시남구/포항시북구' → '포항시' (나이스의 시군 단위와 통일)
+    al["시군"] = (al["_시군구"].str.replace("남구", "", regex=False)
+                              .str.replace("북구", "", regex=False))
+    keep = ["SCHUL_NM", "_학교급", "시군", "학생수", "학급수"]
+    if "특수학급학생수" in al.columns:
+        keep.append("특수학급학생수")
+    return al[keep]
+
+
+def attach_students(df: pd.DataFrame, al: pd.DataFrame) -> pd.DataFrame:
+    """나이스 데이터에 알리미 학생수를 3중 키로 병합 (실패해도 원본 유지)."""
+    return df.merge(
+        al,
+        left_on=["SCHUL_NM", "학교급", "시군"],
+        right_on=["SCHUL_NM", "_학교급", "시군"],
+        how="left",           # 알리미에 없는 학교(특수·기타·개교예정)도 유지
+    ).drop(columns=["_학교급"], errors="ignore")
+
+
+# ══════════════════════════════════════════════════════════
 # [역할 ④] 나이스 실시간 API (급식·학사일정)
 #   - ttl=3600: 같은 조회는 1시간 동안 캐시 재사용 → 일일 트래픽 절약
 #   - 실패 시 None 반환하고 화면에서 안내 (앱이 죽지 않게)
@@ -272,6 +321,10 @@ def clean_menu(raw: str) -> str:
 # ══════════════════════════════════════════════════════════
 df = load_data()
 geo = load_geo()
+alimi = load_alimi()
+has_students = alimi is not None
+if has_students:
+    df = attach_students(df, alimi)   # 학생수·학급수 컬럼이 df에 추가됨
 
 st.sidebar.title("🏫 경북 학교 현황")
 st.sidebar.caption(f"코드 버전: {VERSION}")
@@ -288,9 +341,17 @@ selected = st.sidebar.selectbox(f"{group_col} 선택", options)
 
 include_planned = st.sidebar.checkbox("개교 예정 학교 포함", value=True)
 
+# 소규모학교 필터 (학생수 데이터가 있을 때만 노출)
+only_small = False
+if has_students:
+    only_small = st.sidebar.checkbox(
+        f"소규모학교만 보기 (전교생 {SMALL_MAX}명 이하)", value=False)
+
 view = df if selected == "전체" else df[df[group_col] == selected]
 if not include_planned:
     view = view[~view["개교예정"]]
+if only_small:
+    view = view[view["학생수"] <= SMALL_MAX]   # NaN(학생수 미상)은 자동 제외됨
 
 # ══════════════════════════════════════════════════════════
 # [역할 ⑥] 요약 카드 (KPI)
@@ -302,6 +363,22 @@ c1.metric("전체 학교", f"{len(view):,}개교")
 c2.metric("초등학교", f"{(view['학교급'] == '초등학교').sum():,}개교")
 c3.metric("중학교", f"{(view['학교급'] == '중학교').sum():,}개교")
 c4.metric("고등학교", f"{(view['학교급'] == '고등학교').sum():,}개교")
+
+# ── 학생수 KPI (알리미 데이터가 있을 때만 2번째 줄로 표시) ──
+if has_students and view["학생수"].notna().any():
+    total_std = int(view["학생수"].sum())        # NaN은 sum에서 자동 제외
+    total_cls = int(view["학급수"].sum())
+    n_small = int((view["학생수"] <= SMALL_MAX).sum())
+    n_known = int(view["학생수"].notna().sum())  # 학생수를 아는 학교 수(비율의 분모)
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("총 학생수", f"{total_std:,}명")
+    d2.metric("총 학급수", f"{total_cls:,}학급")
+    # 학급당 학생수 = 총 학생 ÷ 총 학급 (0 나눗셈 방어)
+    d3.metric("학급당 학생수", f"{total_std / total_cls:.1f}명" if total_cls else "—")
+    d4.metric(f"소규모학교({SMALL_MAX}명↓)",
+              f"{n_small}개교", delta=f"{n_small / n_known * 100:.1f}%",
+              delta_color="off")   # delta를 증감이 아닌 비율 표시로 사용
+    st.caption("※ 학생수는 학교알리미 공시(학교 현황) 기준 · 특수·각종학교 등 미공시 학교는 집계에서 제외")
 
 # ══════════════════════════════════════════════════════════
 # [역할 ⑦] 탭 구조
@@ -319,14 +396,28 @@ with tab_chart:
     left, right = st.columns(2)
 
     with left:
-        st.subheader(f"{group_col}별 학교 수")
-        counts = df.groupby([group_col, "학교급"]).size().reset_index(name="학교수")
-        fig = px.bar(
-            counts, x=group_col, y="학교수", color="학교급",
-            category_orders={"학교급": ["초등학교", "중학교", "고등학교", "특수학교", "기타"]},
-        )
-        fig.update_layout(xaxis={"categoryorder": "total descending"})
-        st.plotly_chart(fig, width="stretch")
+        st.subheader(f"{group_col}별 현황")
+        kind_order = {"학교급": ["초등학교", "중학교", "고등학교", "특수학교", "기타"]}
+        c_tab1, c_tab2 = st.tabs(["학교 수", "학생 수"])
+        with c_tab1:
+            counts = df.groupby([group_col, "학교급"]).size().reset_index(name="학교수")
+            fig = px.bar(counts, x=group_col, y="학교수", color="학교급",
+                         category_orders=kind_order)
+            fig.update_layout(xaxis={"categoryorder": "total descending"})
+            st.plotly_chart(fig, width="stretch")
+        with c_tab2:
+            if has_students:
+                # 같은 groupby 3단 패턴, 집계만 size()→학생수 sum()으로 교체
+                std = (df.dropna(subset=["학생수"])
+                         .groupby([group_col, "학교급"])["학생수"]
+                         .sum().reset_index(name="학생수"))
+                fig2 = px.bar(std, x=group_col, y="학생수", color="학교급",
+                              category_orders=kind_order)
+                fig2.update_layout(xaxis={"categoryorder": "total descending"})
+                st.plotly_chart(fig2, width="stretch")
+            else:
+                st.info(f"학생수 표시에는 `{ALIMI_CSV}` 파일이 필요합니다. "
+                        "(alimi_api_test.py 실행으로 생성)")
 
     with right:
         st.subheader("설립 구분 · 공학 구분")
@@ -377,27 +468,41 @@ with tab_map:
 
             # ── 병설 처리: 같은 좌표의 학교들을 하나의 마커로 묶기 ──
             # groupby((위도,경도)) 원리: 좌표가 완전히 같은 행들이 한 그룹이 됨
-            # → 감포중+한국국제통상마이스터고처럼 부지를 공유하는 병설 학교들이
-            #   서로를 가리지 않고 한 마커의 팝업 안에 나란히 표시된다
+            def radius_by_students(n) -> float:
+                """
+                학생수 → 마커 반지름 변환.
+                원리: 원의 '면적'이 학생수에 비례해야 시각적으로 정직하다.
+                면적 ∝ 반지름² 이므로 반지름 ∝ √학생수 (제곱근 스케일).
+                학생수를 반지름에 그대로 쓰면 큰 학교가 과장되어 보인다.
+                """
+                if pd.isna(n) or n <= 0:
+                    return 5.0                     # 학생수 미상: 기본 크기
+                return min(4 + (n ** 0.5) / 3, 18)  # 4~18 사이로 제한
+
             for (lat, lng), grp in mapped.groupby(["위도", "경도"]):
                 kinds = grp["학교급"].unique()
+                std_sum = grp["학생수"].sum() if has_students else pd.NA
+                std_txt = (f" · {int(std_sum):,}명"
+                           if has_students and pd.notna(std_sum) and std_sum > 0 else "")
 
                 if len(grp) == 1:
-                    # 단독 학교: 학교급 색상의 기본 마커
                     color = KIND_COLOR.get(kinds[0], "#868e96")
-                    radius = 6
-                    tooltip = grp.iloc[0]["SCHUL_NM"]
+                    tooltip = grp.iloc[0]["SCHUL_NM"] + std_txt
                 else:
-                    # 병설: 학교급이 하나면 그 색, 섞여 있으면 전용 자주색으로 구분
                     color = KIND_COLOR.get(kinds[0], "#868e96") if len(kinds) == 1 else MIXED_COLOR
-                    radius = 8  # 여러 학교임을 크기로도 암시
-                    tooltip = " · ".join(grp["SCHUL_NM"]) + f" (병설 {len(grp)}개교)"
+                    tooltip = " · ".join(grp["SCHUL_NM"]) + f" (병설 {len(grp)}개교){std_txt}"
 
-                # 팝업 HTML: 그룹 내 모든 학교를 나열
-                lines = "".join(
-                    f"<b>{r.SCHUL_NM}</b> <small>({r.학교급} · {r.FOND_SC_NM})</small><br>"
-                    for r in grp.itertuples()
-                )
+                radius = radius_by_students(std_sum) if has_students else (6 if len(grp) == 1 else 8)
+
+                # 팝업 HTML: 그룹 내 모든 학교를 나열 (+학생수·학급수)
+                def school_line(r):
+                    extra = ""
+                    if has_students and pd.notna(getattr(r, "학생수", None)):
+                        extra = f" · {int(r.학생수):,}명/{int(r.학급수)}학급"
+                    return (f"<b>{r.SCHUL_NM}</b> "
+                            f"<small>({r.학교급} · {r.FOND_SC_NM}{extra})</small><br>")
+
+                lines = "".join(school_line(r) for r in grp.itertuples())
                 popup_html = lines + f"<small>{grp.iloc[0]['ORG_RDNMA']}</small>"
 
                 folium.CircleMarker(
@@ -422,6 +527,8 @@ with tab_map:
                 f'<span style="color:{c}">●</span> {k}' for k, c in KIND_COLOR.items()
             )
             legend += f'&nbsp;&nbsp;<span style="color:{MIXED_COLOR}">●</span> 병설(학교급 혼합)'
+            if has_students:
+                legend += "&nbsp;&nbsp;|&nbsp;&nbsp;원 크기 = 학생수 (면적 비례)"
             if n_shared:
                 legend += f"&nbsp;&nbsp;|&nbsp;&nbsp;현재 화면 병설 학교 {n_shared}개교"
             st.markdown(
@@ -528,6 +635,8 @@ with tab_table:
         "학교급": "학교급",
         "시군": "시군",
         "지원청": "관할",
+        "학생수": "학생수",
+        "학급수": "학급수",
         "FOND_SC_NM": "설립",
         "COEDU_SC_NM": "공학구분",
         "HS_SC_NM": "고교유형",
