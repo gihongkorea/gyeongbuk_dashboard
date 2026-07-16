@@ -30,7 +30,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v4.1 (동명이교 좌표 오배치 수정)"
+VERSION = "v4.2 (근접좌표 병설 그룹핑·마커 z순서)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -480,8 +480,15 @@ with tab_map:
                 tiles="cartodbpositron",
             )
 
-            # ── 병설 처리: 같은 좌표의 학교들을 하나의 마커로 묶기 ──
-            # groupby((위도,경도)) 원리: 좌표가 완전히 같은 행들이 한 그룹이 됨
+            # ── 병설 처리: '거의 같은' 좌표의 학교들을 하나의 마커로 묶기 ──
+            # 좌표를 소수 4자리(약 11m)로 반올림해 그룹핑.
+            # 원리: 병설 학교인데 좌표 끝자리가 미세하게 다르게 기록된 경우
+            # (오천중 129.412792 vs 오천고 129.412793 = 10cm 차이)가 8곳 있어,
+            # 완전 일치 groupby로는 별개 마커가 되고 큰 원이 작은 원을 가린다.
+            mapped = mapped.copy()
+            mapped["_그룹위도"] = mapped["위도"].round(4)
+            mapped["_그룹경도"] = mapped["경도"].round(4)
+
             def radius_by_students(n) -> float:
                 """
                 학생수 → 마커 반지름 변환.
@@ -493,7 +500,10 @@ with tab_map:
                     return 5.0                     # 학생수 미상: 기본 크기
                 return min(4 + (n ** 0.5) / 3, 18)  # 4~18 사이로 제한
 
-            for (lat, lng), grp in mapped.groupby(["위도", "경도"]):
+            markers = []   # (반지름, 마커 인자)를 모았다가 정렬 후 그리기
+            for _, grp in mapped.groupby(["_그룹위도", "_그룹경도"]):
+                # 그룹의 실제 좌표 평균을 마커 위치로 (반올림 좌표가 아닌 원본 기준)
+                lat, lng = grp["위도"].mean(), grp["경도"].mean()
                 kinds = grp["학교급"].unique()
                 std_sum = grp["학생수"].sum() if has_students else pd.NA
                 std_txt = (f" · {int(std_sum):,}명"
@@ -519,6 +529,13 @@ with tab_map:
                 lines = "".join(school_line(r) for r in grp.itertuples())
                 popup_html = lines + f"<small>{grp.iloc[0]['ORG_RDNMA']}</small>"
 
+                markers.append((radius, lat, lng, color, popup_html, tooltip))
+
+            # z-순서 원칙: 큰 원을 먼저, 작은 원을 나중에 그린다.
+            # folium은 나중에 추가된 마커가 위에 오므로, 반지름 내림차순으로
+            # 정렬해 추가하면 작은 학교가 항상 위에 노출되어 가려지지 않는다.
+            for radius, lat, lng, color, popup_html, tooltip in sorted(
+                    markers, key=lambda t: -t[0]):
                 folium.CircleMarker(
                     location=[lat, lng],
                     radius=radius,
@@ -536,7 +553,7 @@ with tab_map:
             # 원리: st.caption의 ●는 전부 같은 글자색이라 범례 구실을 못 함
             # → <span style="color:...">●</span> 으로 점마다 색 지정
             # unsafe_allow_html=True: 마크다운 안에서 HTML 태그 허용 옵션
-            n_shared = int(mapped.duplicated(subset=["위도", "경도"], keep=False).sum())
+            n_shared = int(mapped.duplicated(subset=["_그룹위도", "_그룹경도"], keep=False).sum())
             legend = "&nbsp;&nbsp;".join(
                 f'<span style="color:{c}">●</span> {k}' for k, c in KIND_COLOR.items()
             )
