@@ -32,7 +32,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v5.0 (실시간 API 우선 · 저장본 예비)"
+VERSION = "v5.1 (OSM 배경 대비 음영 눈금 상향)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -723,8 +723,10 @@ with tab_map:
                     # 하위권 군 지역이 투명(0.05)해져 '안 그려진 것처럼' 보였다.
                     # pd.qcut = 값의 '순위'로 5등분 → 모든 시군이 보이면서
                     # 상대 비교도 유지되는 단계구분도의 정석 기법.
+                    # 눈금 0.22~0.66: OSM 컬러 배경 기준으로 재조정
+                    # (0.12는 회색 CARTO 배경용이라 OSM 위에선 사실상 투명했음)
                     grade = pd.qcut(sigun_std, 5, labels=False)   # 0(하위)~4(상위)
-                    shade = (0.12 + 0.12 * grade).to_dict()       # 0.12 ~ 0.60
+                    shade = (0.22 + 0.11 * grade).to_dict()       # 0.22 ~ 0.66
                 else:
                     shade = {}
 
