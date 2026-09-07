@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 경북 학교 현황 대시보드 v4
@@ -31,7 +32,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v4.4 (배경 타일 OSM 교체 - CARTO 키 요구 대응)"
+VERSION = "v4.5 (실패 비캐시 - 파일 늦게 올려도 자동 인식)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -130,12 +131,9 @@ def norm_addr(s: pd.Series) -> pd.Series:
 
 
 @st.cache_data
-def load_geo() -> pd.DataFrame | None:
-    """위치표준데이터에서 (학교명, 학교급, 주소키, 위도, 경도)를 추출. 파일 없으면 None."""
-    try:
-        geo = read_csv_any_encoding(GEO_CSV)
-    except FileNotFoundError:
-        return None
+def _load_geo_impl() -> pd.DataFrame | None:
+    """위치표준데이터에서 (학교명, 학교급, 주소키, 위도, 경도)를 추출."""
+    geo = read_csv_any_encoding(GEO_CSV)   # 파일 없으면 예외 → 캐시되지 않음
 
     # 방어: 컬럼명 부분일치로 찾음 (표기 변형 대비)
     lat_col = next((c for c in geo.columns if "위도" in c), None)
@@ -174,6 +172,14 @@ def load_geo() -> pd.DataFrame | None:
     dedup_keys = ["학교명", "시군"] if "시군" in out.columns else ["학교명"]
     out = out.drop_duplicates(subset=dedup_keys, keep="first")
     return out
+
+
+def load_geo() -> pd.DataFrame | None:
+    """위치 파일 없으면 None. 실패는 캐시 밖에서 처리 (실패 비캐시 원칙)."""
+    try:
+        return _load_geo_impl()
+    except FileNotFoundError:
+        return None
 
 
 def match_coords(view: pd.DataFrame, geo: pd.DataFrame) -> pd.DataFrame:
@@ -241,22 +247,29 @@ ALIMI_ALIAS = {
 
 
 @st.cache_data
+def _read_boundaries() -> dict:
+    # 파일이 없으면 예외 발생 → st.cache_data는 예외를 캐시하지 않음
+    with open(BOUNDARY_GEOJSON, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_boundaries() -> dict | None:
-    """시군 행정경계 GeoJSON 로딩. 파일 없으면 None (지도는 경계 없이 동작)."""
+    """
+    시군 행정경계 GeoJSON 로딩. 파일 없으면 None (지도는 경계 없이 동작).
+    구조 원리: '실패는 캐시하지 않는다'. 캐시 함수가 None을 반환하면
+    그 None이 저장되어, 나중에 파일을 올려도 계속 없음으로 남는다(배포 순서 함정).
+    예외는 캐시되지 않으므로, 성공만 캐시 함수 안에서 일어나게 분리했다.
+    """
     try:
-        with open(BOUNDARY_GEOJSON, encoding="utf-8") as f:
-            return json.load(f)
+        return _read_boundaries()
     except FileNotFoundError:
         return None
 
 
 @st.cache_data
-def load_alimi() -> pd.DataFrame | None:
-    """알리미 학교현황(62)에서 병합 키 3종 + 학생수·학급수를 추출. 파일 없으면 None."""
-    try:
-        al = read_csv_any_encoding(ALIMI_CSV)
-    except FileNotFoundError:
-        return None
+def _load_alimi_impl() -> pd.DataFrame | None:
+    """알리미 학교현황(62)에서 병합 키 3종 + 학생수·학급수를 추출."""
+    al = read_csv_any_encoding(ALIMI_CSV)   # 파일 없으면 예외 → 캐시되지 않음
     need = {"SCHUL_NM", "_학교급", "_시군구", "학생수", "학급수"}
     if not need <= set(al.columns):
         return None   # 정제 컬럼이 없는 옛 수집본이면 사용하지 않음 (방어)
@@ -271,6 +284,14 @@ def load_alimi() -> pd.DataFrame | None:
     if "특수학급학생수" in al.columns:
         keep.append("특수학급학생수")
     return al[keep]
+
+
+def load_alimi() -> pd.DataFrame | None:
+    """알리미 파일 없으면 None. 실패는 캐시 밖에서 처리 (실패 비캐시 원칙)."""
+    try:
+        return _load_alimi_impl()
+    except FileNotFoundError:
+        return None
 
 
 def attach_students(df: pd.DataFrame, al: pd.DataFrame) -> pd.DataFrame:
