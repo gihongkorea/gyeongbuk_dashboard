@@ -31,7 +31,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v4.3 (시군 경계선·학생수 단계구분도)"
+VERSION = "v4.4 (배경 타일 OSM 교체 - CARTO 키 요구 대응)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -489,7 +489,10 @@ with tab_map:
             m = folium.Map(
                 location=[mapped["위도"].mean(), mapped["경도"].mean()],
                 zoom_start=10 if selected != "전체" else 8,
-                tiles="cartodbpositron",
+                # 배경 타일: OpenStreetMap (키 불필요, 커뮤니티 운영)
+                # ※ 이전에 쓰던 CARTO(cartodbpositron)는 정책 변경으로
+                #   API 키를 요구하게 되어 교체함 (2026.9 확인)
+                tiles="OpenStreetMap",
             )
 
             # ── 시군 경계선 + 학생수 단계구분도(choropleth) ──
