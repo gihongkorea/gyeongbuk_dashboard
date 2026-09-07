@@ -32,7 +32,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v5.1 (OSM 배경 대비 음영 눈금 상향)"
+VERSION = "v5.2 (선택지역 채우기 제거·이모지 아이콘 마커)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -68,6 +68,18 @@ KIND_COLOR = {
     "기타": "#868e96",       # 회색
 }
 MIXED_COLOR = "#9c36b5"      # 병설(학교급 혼합) 전용 자주색
+
+# 지도 마커 이모지 (학교급 구분)
+# 이모지 사용 이유: 폰트아이콘(FontAwesome 등)은 버전 의존성이 있어
+# 배포 환경에 따라 깨질 수 있지만, 이모지는 브라우저 내장이라 의존성 0
+KIND_EMOJI = {
+    "초등학교": "🎒",
+    "중학교": "📘",
+    "고등학교": "🎓",
+    "특수학교": "♿",
+    "기타": "📚",
+}
+MIXED_EMOJI = "🏫"           # 병설(같은 부지 복수 학교)
 
 
 # ══════════════════════════════════════════════════════════
@@ -734,8 +746,10 @@ with tab_map:
                     sg = feature["properties"]["시군"]
                     return {
                         "fillColor": "#1971c2",
-                        "fillOpacity": shade.get(sg, 0.0),
-                        # 선택된 시군은 굵은 진한 테두리로 강조
+                        # 선택된 시군은 채우기 없음: 확대해서 볼 때 파란 막이
+                        # 지도를 덮는 것을 방지. 음영은 '시군 간 비교'용이므로
+                        # 특정 시군을 보는 중엔 소음이다. 테두리 강조만 유지.
+                        "fillOpacity": 0.0 if sg == selected else shade.get(sg, 0.0),
                         "color": "#e8590c" if sg == selected else "#5c7080",
                         "weight": 3 if sg == selected else 1,
                     }
@@ -758,18 +772,17 @@ with tab_map:
             mapped["_그룹위도"] = mapped["위도"].round(4)
             mapped["_그룹경도"] = mapped["경도"].round(4)
 
-            def radius_by_students(n) -> float:
+            def size_by_students(n) -> int:
                 """
-                학생수 → 마커 반지름 변환.
-                원리: 원의 '면적'이 학생수에 비례해야 시각적으로 정직하다.
-                면적 ∝ 반지름² 이므로 반지름 ∝ √학생수 (제곱근 스케일).
-                학생수를 반지름에 그대로 쓰면 큰 학교가 과장되어 보인다.
+                학생수 → 이모지 아이콘 크기(px) 변환.
+                제곱근 스케일 원리는 원 반지름 때와 동일: 시각적 크기가
+                학생수에 과장 없이 비례하도록 √학생수를 쓴다. 범위 14~34px.
                 """
                 if pd.isna(n) or n <= 0:
-                    return 5.0                     # 학생수 미상: 기본 크기
-                return min(4 + (n ** 0.5) / 3, 18)  # 4~18 사이로 제한
+                    return 16                      # 학생수 미상: 기본 크기
+                return int(min(13 + (n ** 0.5) / 2.2, 34))
 
-            markers = []   # (반지름, 마커 인자)를 모았다가 정렬 후 그리기
+            markers = []   # (크기, 마커 인자)를 모았다가 정렬 후 그리기
             for _, grp in mapped.groupby(["_그룹위도", "_그룹경도"]):
                 # 그룹의 실제 좌표 평균을 마커 위치로 (반올림 좌표가 아닌 원본 기준)
                 lat, lng = grp["위도"].mean(), grp["경도"].mean()
@@ -779,13 +792,14 @@ with tab_map:
                            if has_students and pd.notna(std_sum) and std_sum > 0 else "")
 
                 if len(grp) == 1:
-                    color = KIND_COLOR.get(kinds[0], "#868e96")
+                    emoji = KIND_EMOJI.get(kinds[0], "📚")
                     tooltip = grp.iloc[0]["SCHUL_NM"] + std_txt
                 else:
-                    color = KIND_COLOR.get(kinds[0], "#868e96") if len(kinds) == 1 else MIXED_COLOR
+                    # 병설: 학교급이 하나든 섞였든 '한 부지 복수 학교'는 🏫로 통일
+                    emoji = MIXED_EMOJI
                     tooltip = " · ".join(grp["SCHUL_NM"]) + f" (병설 {len(grp)}개교){std_txt}"
 
-                radius = radius_by_students(std_sum) if has_students else (6 if len(grp) == 1 else 8)
+                size = size_by_students(std_sum) if has_students else (18 if len(grp) == 1 else 24)
 
                 # 팝업 HTML: 그룹 내 모든 학교를 나열 (+학생수·학급수)
                 def school_line(r):
@@ -798,18 +812,25 @@ with tab_map:
                 lines = "".join(school_line(r) for r in grp.itertuples())
                 popup_html = lines + f"<small>{grp.iloc[0]['ORG_RDNMA']}</small>"
 
-                markers.append((radius, lat, lng, color, popup_html, tooltip))
+                markers.append((size, lat, lng, emoji, popup_html, tooltip))
 
-            # z-순서 원칙: 큰 원을 먼저, 작은 원을 나중에 그린다.
-            # folium은 나중에 추가된 마커가 위에 오므로, 반지름 내림차순으로
-            # 정렬해 추가하면 작은 학교가 항상 위에 노출되어 가려지지 않는다.
-            for radius, lat, lng, color, popup_html, tooltip in sorted(
+            # z-순서: Leaflet의 일반 마커는 기본적으로 위도순으로 쌓이므로,
+            # z_index_offset으로 '작은 학교일수록 위'를 강제한다
+            # (큰 아이콘이 작은 아이콘을 가리지 않게 — 오천중 사건 재발 방지)
+            for size, lat, lng, emoji, popup_html, tooltip in sorted(
                     markers, key=lambda t: -t[0]):
-                folium.CircleMarker(
+                folium.Marker(
                     location=[lat, lng],
-                    radius=radius,
-                    color=color,
-                    fill=True, fill_opacity=0.85,
+                    # DivIcon: HTML 조각을 그대로 마커로 쓰는 기능.
+                    # 이모지 글자 하나를 크기 지정해 아이콘으로 사용하고,
+                    # text-shadow로 흰 테두리를 둘러 어떤 배경에서도 또렷하게.
+                    icon=folium.DivIcon(
+                        html=(f'<div style="font-size:{size}px; line-height:1; '
+                              f'text-shadow: 0 0 3px #fff, 0 0 5px #fff;">{emoji}</div>'),
+                        icon_size=(size, size),
+                        icon_anchor=(size // 2, size // 2),   # 아이콘 중심 = 좌표
+                    ),
+                    z_index_offset=int((40 - size) * 100),
                     popup=folium.Popup(popup_html, max_width=280),
                     tooltip=tooltip,
                 ).add_to(m)
@@ -818,17 +839,12 @@ with tab_map:
             # 일으키지 않도록 차단 → 체감 속도 향상
             st_folium(m, height=520, width="100%", returned_objects=[])
 
-            # 범례: HTML로 각 점에 실제 마커 색을 입힘
-            # 원리: st.caption의 ●는 전부 같은 글자색이라 범례 구실을 못 함
-            # → <span style="color:...">●</span> 으로 점마다 색 지정
-            # unsafe_allow_html=True: 마크다운 안에서 HTML 태그 허용 옵션
+            # 범례: 이모지 아이콘 안내
             n_shared = int(mapped.duplicated(subset=["_그룹위도", "_그룹경도"], keep=False).sum())
-            legend = "&nbsp;&nbsp;".join(
-                f'<span style="color:{c}">●</span> {k}' for k, c in KIND_COLOR.items()
-            )
-            legend += f'&nbsp;&nbsp;<span style="color:{MIXED_COLOR}">●</span> 병설(학교급 혼합)'
+            legend = "&nbsp;&nbsp;".join(f"{e} {k}" for k, e in KIND_EMOJI.items())
+            legend += f"&nbsp;&nbsp;{MIXED_EMOJI} 병설(한 부지 복수 학교)"
             if has_students:
-                legend += ("&nbsp;&nbsp;|&nbsp;&nbsp;원 크기 = 학생수 (면적 비례)"
+                legend += ("&nbsp;&nbsp;|&nbsp;&nbsp;아이콘 크기 = 학생수"
                            "&nbsp;·&nbsp;시군 음영 = 학생수 5단계")
             if n_shared:
                 legend += f"&nbsp;&nbsp;|&nbsp;&nbsp;현재 화면 병설 학교 {n_shared}개교"
