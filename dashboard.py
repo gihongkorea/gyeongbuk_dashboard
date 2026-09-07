@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 경북 학교 현황 대시보드 v4
@@ -16,6 +15,7 @@
 
 import re
 import json
+import time
 import datetime as dt
 
 import requests
@@ -32,7 +32,7 @@ st.set_page_config(page_title="경북 학교 현황", page_icon="🏫", layout="
 
 # 버전 표식: 사이드바에 표시되어 '지금 어떤 코드가 실행 중인지' 즉시 확인 가능
 # (파일 교체 누락 사고 방지 — 수정할 때마다 숫자를 올릴 것)
-VERSION = "v4.5 (실패 비캐시 - 파일 늦게 올려도 자동 인식)"
+VERSION = "v5.0 (실시간 API 우선 · 저장본 예비)"
 
 # ── API 키 읽기: 비밀과 코드의 분리 ──
 # 1순위: .streamlit/secrets.toml 의 NEIS_KEY  (배포·GitHub 공개 시 안전)
@@ -43,11 +43,18 @@ try:
     API_KEY = st.secrets["NEIS_KEY"]
 except Exception:
     API_KEY = ""          # ← 로컬 간편 사용 시 여기에 인증키 입력
+
+# 학교알리미 인증키 (실시간 학생수 조회용) — Secrets에 ALIMI_KEY 추가
+try:
+    ALIMI_KEY = st.secrets["ALIMI_KEY"]
+except Exception:
+    ALIMI_KEY = ""
 OFFICE_CODE = "R10"   # 경상북도교육청
 
 GEO_CSV = "school_locations.csv"   # 위치표준데이터 파일명
 ALIMI_CSV = "alimi_gyeongbuk_62.csv"   # 학교알리미 학교현황(62) 수집본
 BOUNDARY_GEOJSON = "gyeongbuk_sigungu.geojson"   # 시군 행정경계 (통계청 기반 공개 데이터)
+SPECIAL_CSV = "special_locations.csv"   # 좌표 보정 파일 (특수학교 등 위치데이터 미수록분)
 SMALL_MAX = 60                     # 소규모학교 기준: 전교생 60명 이하
 
 # 학교급별 지도 마커 색
@@ -64,12 +71,13 @@ MIXED_COLOR = "#9c36b5"      # 병설(학교급 혼합) 전용 자주색
 
 
 # ══════════════════════════════════════════════════════════
-# [역할 ②] 데이터 로딩 + 정제 (v2와 동일 로직)
+# [역할 ②] 학교 기본정보 로딩 — 실시간 우선, 저장본 예비
+#   1순위: 나이스 API 실시간 (1~2회 호출, 24시간 캐시)
+#   2순위: gyeongbuk_schools.csv (API 실패 시 예비)
 # ══════════════════════════════════════════════════════════
-@st.cache_data
-def load_data() -> pd.DataFrame:
-    df = pd.read_csv("gyeongbuk_schools.csv", encoding="utf-8-sig")
-
+def _derive_neis(df: pd.DataFrame) -> pd.DataFrame:
+    """나이스 원본(API든 CSV든)에 파생 컬럼을 만드는 공통 정제부."""
+    df = df.copy()
     # 시군 추출: 주소 두 번째 단어 ("경상북도 구미시 ..." → "구미시")
     df["시군"] = df["ORG_RDNMA"].astype(str).str.split().str[1]
 
@@ -96,6 +104,55 @@ def load_data() -> pd.DataFrame:
     df.loc[junk, "HMPG_ADRES"] = pd.NA
 
     return df
+
+
+@st.cache_data(ttl=86400, show_spinner="나이스에서 학교 기본정보 수집 중...")
+def _fetch_neis_live() -> pd.DataFrame:
+    """
+    나이스 학교기본정보 실시간 수집. ttl=86400: 하루 한 번만 실제 호출.
+    품질 게이트: 800건 미만이면 부분 응답으로 판단하고 예외를 던진다.
+    예외는 캐시되지 않으므로(실패 비캐시 원칙) 다음 방문 때 재시도된다.
+    """
+    all_rows, page = [], 1
+    while True:
+        params = {"Type": "json", "pIndex": page, "pSize": 1000,
+                  "ATPT_OFCDC_SC_CODE": OFFICE_CODE}
+        if API_KEY:
+            params["KEY"] = API_KEY
+        res = requests.get("https://open.neis.go.kr/hub/schoolInfo",
+                           params=params, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        if "schoolInfo" not in data:
+            if data.get("RESULT", {}).get("CODE") == "INFO-200":
+                break
+            raise RuntimeError(f"나이스 API 오류: {data.get('RESULT')}")
+        rows = data["schoolInfo"][1]["row"]
+        all_rows.extend(rows)
+        if len(rows) < 1000:
+            break
+        page += 1
+
+    df = pd.DataFrame(all_rows)
+    if len(df) < 800:   # 경북 초중고특수는 900여 개교
+        raise RuntimeError(f"나이스 수집 {len(df)}건 — 부분 응답 의심, 캐시 안 함")
+    return df
+
+
+@st.cache_data
+def _read_neis_csv() -> pd.DataFrame:
+    return read_csv_any_encoding("gyeongbuk_schools.csv")
+
+
+def load_data() -> tuple[pd.DataFrame, str]:
+    """
+    학교 기본정보를 (데이터, 출처 라벨)로 반환.
+    실시간 우선 + 저장본 예비 = 점진적 저하: API가 죽어도 화면은 뜬다.
+    """
+    try:
+        return _derive_neis(_fetch_neis_live()), "나이스 API 실시간"
+    except Exception:
+        return _derive_neis(_read_neis_csv()), "저장본 CSV (API 실패 예비)"
 
 
 # ══════════════════════════════════════════════════════════
@@ -267,23 +324,128 @@ def load_boundaries() -> dict | None:
 
 
 @st.cache_data
-def _load_alimi_impl() -> pd.DataFrame | None:
-    """알리미 학교현황(62)에서 병합 키 3종 + 학생수·학급수를 추출."""
-    al = read_csv_any_encoding(ALIMI_CSV)   # 파일 없으면 예외 → 캐시되지 않음
-    need = {"SCHUL_NM", "_학교급", "_시군구", "학생수", "학급수"}
-    if not need <= set(al.columns):
-        return None   # 정제 컬럼이 없는 옛 수집본이면 사용하지 않음 (방어)
+def _load_special_impl() -> pd.DataFrame:
+    """좌표 보정 파일: 위치표준데이터에 없는 학교(특수학교 등)의 수기 좌표."""
+    sp = read_csv_any_encoding(SPECIAL_CSV)
+    sp["위도"] = pd.to_numeric(sp["위도"], errors="coerce")
+    sp["경도"] = pd.to_numeric(sp["경도"], errors="coerce")
+    # 좌표가 채워진 행만 사용 (템플릿의 빈 행은 자동 무시)
+    return (sp.dropna(subset=["위도", "경도"])
+              [["SCHUL_NM", "위도", "경도"]]
+              .drop_duplicates(subset="SCHUL_NM"))
 
+
+def load_special() -> pd.DataFrame | None:
+    """보정 파일 없으면 None. 실패는 캐시 밖에서 처리 (실패 비캐시 원칙)."""
+    try:
+        return _load_special_impl()
+    except FileNotFoundError:
+        return None
+
+
+# ══════════════════════════════════════════════════════════
+# [역할 ③-3] 학교알리미 실시간 수집 (collect_alimi.py 로직의 대시보드판)
+#   - 22시군구(포항 분구 포함 23코드) × 초중고 = 69회 호출 → 최초 약 1분
+#   - ttl=86400: 하루 한 번만 실제 수집, 이후 캐시 재사용
+# ══════════════════════════════════════════════════════════
+ALIMI_SGG = {
+    "47111": "포항시남구", "47113": "포항시북구",
+    "47130": "경주시",   "47150": "김천시",   "47170": "안동시",
+    "47190": "구미시",   "47210": "영주시",   "47230": "영천시",
+    "47250": "상주시",   "47280": "문경시",   "47290": "경산시",
+    "47730": "의성군",   "47750": "청송군",   "47760": "영양군",
+    "47770": "영덕군",   "47820": "청도군",   "47830": "고령군",
+    "47840": "성주군",   "47850": "칠곡군",   "47900": "예천군",
+    "47920": "봉화군",   "47930": "울진군",   "47940": "울릉군",
+}
+ALIMI_KIND = {"02": "초등학교", "03": "중학교", "04": "고등학교"}
+
+
+def _split_paren(s):
+    """알리미 표기 '42(2)' → (42, 2): 전체와 괄호 속(특수학급) 분해."""
+    m = re.match(r"^\s*(\d+)\s*(?:\((\d+)\))?\s*$", str(s))
+    if not m:
+        return pd.NA, pd.NA
+    return int(m.group(1)), int(m.group(2) or 0)
+
+
+def _call_alimi_once(year: str, kind: str, sgg: str) -> list | None:
+    params = {"apiKey": ALIMI_KEY, "apiType": "62", "pbanYr": year,
+              "schulKndCode": kind, "sidoCode": "47", "sggCode": sgg}
+    res = requests.get("https://www.schoolinfo.go.kr/openApi.do",
+                       params=params, timeout=30)
+    res.raise_for_status()
+    try:
+        data = res.json()
+    except ValueError:
+        return None
+    if isinstance(data, dict) and "list" in data:
+        return data["list"] or []
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _finish_alimi(al: pd.DataFrame) -> pd.DataFrame:
+    """별칭·시군 정규화 등 마무리 정제 (CSV/실시간 공용)."""
     al = al.copy()
-    # 별칭 적용: 알리미 학교명을 나이스 표기로 통일
     al["SCHUL_NM"] = al["SCHUL_NM"].replace(ALIMI_ALIAS)
-    # 시군 정규화: '포항시남구/포항시북구' → '포항시' (나이스의 시군 단위와 통일)
     al["시군"] = (al["_시군구"].str.replace("남구", "", regex=False)
                               .str.replace("북구", "", regex=False))
     keep = ["SCHUL_NM", "_학교급", "시군", "학생수", "학급수"]
     if "특수학급학생수" in al.columns:
         keep.append("특수학급학생수")
     return al[keep]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_alimi_live() -> pd.DataFrame:
+    """
+    학교알리미 학교현황(62) 실시간 수집.
+    품질 게이트: 800건 미만 또는 파싱 실패 5% 초과면 예외
+    → 예외는 캐시되지 않으므로(실패 비캐시) 나쁜 데이터가 하루 동안 박제될 일 없음.
+    """
+    # 공시연도 탐침: 대표 1건으로 유효 연도 확정
+    year = None
+    for y in (str(dt.date.today().year), str(dt.date.today().year - 1)):
+        if _call_alimi_once(y, "02", "47130"):
+            year = y
+            break
+    if year is None:
+        raise RuntimeError("알리미 공시연도 탐침 실패")
+
+    jobs = [(s, k) for s in ALIMI_SGG for k in ALIMI_KIND]
+    prog = st.progress(0.0, text=f"학교알리미 {year}년 공시 수집 중... (최초 1회, 약 1분)")
+    rows = []
+    for i, (sgg, kind) in enumerate(jobs):
+        for r in (_call_alimi_once(year, kind, sgg) or []):
+            r["_학교급"] = ALIMI_KIND[kind]
+            r["_시군구"] = ALIMI_SGG[sgg]
+            rows.append(r)
+        prog.progress((i + 1) / len(jobs))
+        time.sleep(0.1)   # 서버 예절
+    prog.empty()
+
+    al = pd.DataFrame(rows)
+    al[["학생수", "특수학급학생수"]] = al["COL_FGR_SUM"].apply(
+        lambda s: pd.Series(_split_paren(s)))
+    al[["학급수", "특수학급수"]] = al["COL_SUM"].apply(
+        lambda s: pd.Series(_split_paren(s)))
+
+    n_fail = int(al["학생수"].isna().sum())
+    if len(al) < 800 or n_fail > len(al) * 0.05:
+        raise RuntimeError(f"알리미 수집 품질 미달({len(al)}건/실패{n_fail}) — 캐시 안 함")
+    return _finish_alimi(al)
+
+
+@st.cache_data
+def _load_alimi_impl() -> pd.DataFrame | None:
+    """알리미 학교현황(62) 저장본 CSV에서 병합 키 3종 + 학생수·학급수를 추출."""
+    al = read_csv_any_encoding(ALIMI_CSV)   # 파일 없으면 예외 → 캐시되지 않음
+    need = {"SCHUL_NM", "_학교급", "_시군구", "학생수", "학급수"}
+    if not need <= set(al.columns):
+        return None   # 정제 컬럼이 없는 옛 수집본이면 사용하지 않음 (방어)
+    return _finish_alimi(al)   # 별칭·시군 정규화 (실시간 수집과 공용)
 
 
 def load_alimi() -> pd.DataFrame | None:
@@ -366,15 +528,34 @@ def clean_menu(raw: str) -> str:
 # ══════════════════════════════════════════════════════════
 # [역할 ⑤] 사이드바 - 필터 (v2와 동일)
 # ══════════════════════════════════════════════════════════
-df = load_data()
+df, neis_src = load_data()
 geo = load_geo()
-alimi = load_alimi()
+
+st.sidebar.title("🏫 경북 학교 현황")
+st.sidebar.caption(f"코드 버전: {VERSION}")
+
+# ── 학생수 데이터 선택: 실시간(토글) 우선 → 저장본 CSV 예비 ──
+alimi, alimi_src = None, "없음"
+if ALIMI_KEY:
+    use_live = st.sidebar.toggle(
+        "학생수 실시간 조회 (학교알리미 API)", value=False,
+        help="켜면 최신 공시를 직접 수집합니다. 최초 1회 약 1분, 이후 24시간 캐시.")
+    if use_live:
+        try:
+            alimi = _fetch_alimi_live()
+            alimi_src = "알리미 API 실시간"
+        except Exception:
+            st.sidebar.warning("실시간 수집 실패 — 저장본으로 대체합니다.")
+if alimi is None:
+    alimi = load_alimi()
+    if alimi is not None:
+        alimi_src = "저장본 CSV"
+
 has_students = alimi is not None
 if has_students:
     df = attach_students(df, alimi)   # 학생수·학급수 컬럼이 df에 추가됨
 
-st.sidebar.title("🏫 경북 학교 현황")
-st.sidebar.caption(f"코드 버전: {VERSION}")
+st.sidebar.caption(f"기본정보: {neis_src} · 학생수: {alimi_src}")
 
 view_mode = st.sidebar.radio(
     "보기 기준",
@@ -493,8 +674,21 @@ with tab_map:
             f"3. 좌측 상단 메뉴 ⋮ → **Clear cache** 후 Rerun"
         )
     else:
-        # 2단계 매칭: ①학교명 → ②주소+학교급 (개명 학교 구제)
+        # 2단계 매칭: ①학교명+시군 → ②주소+학교급 (개명 학교 구제)
         merged = match_coords(view, geo)
+
+        # ── 3차: 좌표 보정 파일 적용 ──
+        # 위치표준데이터가 초·중·고만 수록하므로, 특수학교 등 미수록 학교는
+        # 수기 보정 파일(SPECIAL_CSV)의 좌표로 구제한다 (있을 때만)
+        special = load_special()
+        if special is not None:
+            miss = merged["위도"].isna()
+            if miss.any():
+                fill = merged.loc[miss, ["SCHUL_NM"]].merge(
+                    special, on="SCHUL_NM", how="left")
+                merged.loc[miss, "위도"] = fill["위도"].values
+                merged.loc[miss, "경도"] = fill["경도"].values
+
         mapped = merged.dropna(subset=["위도", "경도"])
         n_miss = len(merged) - len(mapped)
 
@@ -522,40 +716,35 @@ with tab_map:
             # 카카오/네이버 지도 키 없이도 기관 사이트 수준의 경계 표시가 된다.
             boundaries = load_boundaries()
             if boundaries is not None:
-                # 시군별 학생수 (전체 df 기준: 어느 시군을 선택해도 도 전체 맥락 유지)
                 if has_students:
-                    sigun_std = df.groupby("시군")["학생수"].sum().to_dict()
+                    sigun_std = df.groupby("시군")["학생수"].sum()
+                    # 분위(quantile) 5단계 음영.
+                    # 원리: 선형 스케일은 구미(4.8만)↔울릉(380)의 128배 편차 탓에
+                    # 하위권 군 지역이 투명(0.05)해져 '안 그려진 것처럼' 보였다.
+                    # pd.qcut = 값의 '순위'로 5등분 → 모든 시군이 보이면서
+                    # 상대 비교도 유지되는 단계구분도의 정석 기법.
+                    grade = pd.qcut(sigun_std, 5, labels=False)   # 0(하위)~4(상위)
+                    shade = (0.12 + 0.12 * grade).to_dict()       # 0.12 ~ 0.60
                 else:
-                    sigun_std = {}
-                max_std = max(sigun_std.values()) if sigun_std else 1
+                    shade = {}
 
                 def boundary_style(feature):
                     sg = feature["properties"]["시군"]
-                    n = sigun_std.get(sg, 0)
-                    # 음영 농도 = 학생수 비율 (단계구분도). 데이터 없으면 투명
-                    opacity = 0.05 + 0.35 * (n / max_std) if n else 0.0
                     return {
                         "fillColor": "#1971c2",
-                        "fillOpacity": opacity,
+                        "fillOpacity": shade.get(sg, 0.0),
                         # 선택된 시군은 굵은 진한 테두리로 강조
                         "color": "#e8590c" if sg == selected else "#5c7080",
                         "weight": 3 if sg == selected else 1,
                     }
 
-                # 툴팁에 학생수를 보여주기 위해 properties에 주입
-                # (캐시 원본 훼손 방지를 위해 feature를 얕은 복사로 재구성)
-                feats = []
-                for f in boundaries["features"]:
-                    sg = f["properties"]["시군"]
-                    n = sigun_std.get(sg)
-                    label = f"{sg} · 학생 {int(n):,}명" if n else sg
-                    feats.append({"type": "Feature", "geometry": f["geometry"],
-                                  "properties": {"시군": sg, "표시": label}})
-
+                # 폴리곤 툴팁은 달지 않는다: 시군 폴리곤은 화면 전체를 덮는
+                # 도형이라 지도 어디서든 툴팁이 마우스를 따라다니며 학교
+                # 정보와 겹친다(사용자 피드백). 경계는 시각 정보만 담당하고
+                # 마우스 반응은 학교 마커에만 둔다. 시군 학생수는 KPI·차트에 있음.
                 folium.GeoJson(
-                    {"type": "FeatureCollection", "features": feats},
+                    boundaries,
                     style_function=boundary_style,
-                    tooltip=folium.GeoJsonTooltip(fields=["표시"], labels=False),
                 ).add_to(m)
 
             # ── 병설 처리: '거의 같은' 좌표의 학교들을 하나의 마커로 묶기 ──
@@ -637,7 +826,8 @@ with tab_map:
             )
             legend += f'&nbsp;&nbsp;<span style="color:{MIXED_COLOR}">●</span> 병설(학교급 혼합)'
             if has_students:
-                legend += "&nbsp;&nbsp;|&nbsp;&nbsp;원 크기 = 학생수 (면적 비례)"
+                legend += ("&nbsp;&nbsp;|&nbsp;&nbsp;원 크기 = 학생수 (면적 비례)"
+                           "&nbsp;·&nbsp;시군 음영 = 학생수 5단계")
             if n_shared:
                 legend += f"&nbsp;&nbsp;|&nbsp;&nbsp;현재 화면 병설 학교 {n_shared}개교"
             st.markdown(
